@@ -255,9 +255,10 @@ func (a *archive50) parseFileEncryptionRecord(b readBuf, f *fileBlockHeader) err
 		check = slices.Clone(b.bytes(12))
 	}
 	useMac := flags&file5ExtraCryptUseMac > 0
-	// only need to generate keys for first block or
-	// last block if it has an optional hash key
-	if a.pass == nil || !(f.first || (f.last && useMac)) {
+	// only need to generate keys for first block or when the optional
+	// checksum MAC key is required (packed data checksums on non-last
+	// volume parts or the unpacked checksum on the last part)
+	if a.pass == nil || (!f.first && !useMac) {
 		return nil
 	}
 	keys, err := a.getKeys(kdfCount, salt, check)
@@ -267,6 +268,28 @@ func (a *archive50) parseFileEncryptionRecord(b readBuf, f *fileBlockHeader) err
 	f.key = keys[0]
 	if useMac {
 		f.hashKey = keys[1]
+	}
+	return nil
+}
+
+// parseFileHashRecord processes the optional file hash record from a file
+// header. For files split between volumes the record carries a hash of the
+// packed data contained in the current volume for all parts except the last,
+// while unsplit files and the last part of split files carry the hash of the
+// whole unpacked data.
+func (a *archive50) parseFileHashRecord(b *readBuf, f *fileBlockHeader) error {
+	switch b.uvarint() {
+	case 0: // BLAKE2sp
+		if len(*b) < blake2DigestSize {
+			// recognized hash type but record is truncated
+			return ErrCorruptFileHeader
+		}
+		f.blake2sum = slices.Clone(b.bytes(blake2DigestSize))
+		if f.first {
+			f.blake2 = newBlake2sp
+		}
+	default:
+		// unknown hash type, keep the record data for forward compatibility
 	}
 	return nil
 }
@@ -403,6 +426,7 @@ func parseFileOwnerRecord(b *readBuf, f *fileBlockHeader) error {
 func (a *archive50) parseFileHeader(h *blockHeader50) (*fileBlockHeader, error) {
 	f := new(fileBlockHeader)
 
+	f.is50 = true
 	f.HeaderEncrypted = a.blockKey != nil
 	f.first = h.flags&block5DataNotFirst == 0
 	f.last = h.flags&block5DataNotLast == 0
@@ -473,7 +497,7 @@ func (a *archive50) parseFileHeader(h *blockHeader50) (*fileBlockHeader, error) 
 				f.errs = append(f.errs, encErr)
 			}
 		case file5ExtraHash:
-			// TODO: hash
+			err = a.parseFileHashRecord(&e.data, f)
 		case file5ExtraTime:
 			err = parseFilePrecisionTimeRecord(&e.data, f)
 		case file5ExtraVersion:

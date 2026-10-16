@@ -197,7 +197,8 @@ func (fl *fileBlockList) isDir() bool {
 func (fl *fileBlockList) hasFileHash() bool {
 	fl.mu.RLock()
 	defer fl.mu.RUnlock()
-	return fl.blocks[0].hash != nil
+	h := fl.blocks[0]
+	return h.hash != nil || h.blake2 != nil
 }
 
 func (fl *fileBlockList) removeFileHash() {
@@ -205,6 +206,7 @@ func (fl *fileBlockList) removeFileHash() {
 	defer fl.mu.Unlock()
 	h := *fl.blocks[0]
 	h.hash = nil
+	h.blake2 = nil
 	fl.blocks[0] = &h
 }
 
@@ -220,6 +222,14 @@ type packedFileReader struct {
 	offset int64
 	blocks *fileBlockList
 	opt    *options
+
+	// Per-volume packed data checksums (RAR 5.0 only). They verify the raw
+	// packed bytes of a non-last file part contained in the current volume.
+	// The whole unpacked file is verified separately by checksumReader.
+	pcOn    bool      // packed data checksums apply to the current block
+	pcRead  int64     // packed bytes hashed for the current block
+	pcCRC   hash.Hash // packed CRC32 of the current block, nil if not declared
+	pcBLAKE hash.Hash // packed BLAKE2sp of the current block, nil if not declared
 }
 
 func (f *packedFileReader) init(blocks *fileBlockList) error {
@@ -227,7 +237,95 @@ func (f *packedFileReader) init(blocks *fileBlockList) error {
 	f.h = h
 	f.blocks = blocks
 	f.offset = 0
+	f.resetPackedChecks()
 	return nil
+}
+
+// resetPackedChecks prepares the packed data checksums for the current file
+// block. Non-last blocks of RAR 5.0 files carry checksums of the packed data
+// stored in the current volume, last and unsplit blocks carry no packed
+// checksum here as their checksum covers the whole unpacked data.
+func (f *packedFileReader) resetPackedChecks() {
+	f.pcOn = false
+	f.pcRead = 0
+	f.pcCRC = nil
+	f.pcBLAKE = nil
+
+	if f.opt.skipCheck || f.h == nil || f.h.last {
+		return
+	}
+	first := f.blocks.firstBlock()
+	if !first.is50 || (first.hash == nil && first.blake2 == nil) {
+		return
+	}
+	f.pcOn = true
+	if first.hash != nil && f.h.sum != nil {
+		f.pcCRC = newLittleEndianCRC32()
+	}
+	if first.blake2 != nil && f.h.blake2sum != nil {
+		f.pcBLAKE = newBlake2sp()
+	}
+}
+
+func (f *packedFileReader) feedPackedChecks(p []byte) {
+	if !f.pcOn || len(p) == 0 {
+		return
+	}
+	if f.pcCRC != nil {
+		_, _ = f.pcCRC.Write(p)
+	}
+	if f.pcBLAKE != nil {
+		_, _ = f.pcBLAKE.Write(p)
+	}
+	f.pcRead += int64(len(p))
+}
+
+// finishPackedBlock verifies the packed data checksums for a fully consumed
+// non-last file block. A mismatch is reported as a file checksum error.
+func (f *packedFileReader) finishPackedBlock() error {
+	if !f.pcOn || f.h == nil || f.h.last || f.pcRead != f.h.PackedSize {
+		return nil
+	}
+	key := f.h.hashKey
+	if f.pcCRC != nil {
+		sum := f.pcCRC.Sum(nil)
+		if len(key) > 0 {
+			sum = convertHashToMAC(sum, key)
+		}
+		if !bytes.Equal(sum, f.h.sum) {
+			return ErrBadFileChecksum
+		}
+	}
+	if f.pcBLAKE != nil {
+		sum := f.pcBLAKE.Sum(nil)
+		if len(key) > 0 {
+			sum = convertHashToMAC(sum, key)
+		}
+		if !bytes.Equal(sum, f.h.blake2sum) {
+			return ErrBadFileChecksum
+		}
+	}
+	return nil
+}
+
+// packedTapWriter wraps w so every byte written also feeds the packed data
+// checksums. It returns w unchanged when no packed checksum is active.
+func (f *packedFileReader) packedTapWriter(w io.Writer) io.Writer {
+	if !f.pcOn || (f.pcCRC == nil && f.pcBLAKE == nil) {
+		return w
+	}
+	return io.MultiWriter(w, packedFeedWriter{f: f})
+}
+
+// packedFeedWriter feeds the packed data checksums. Hash writes never fail,
+// so Write always reports the full slice as written.
+type packedFeedWriter struct {
+	f *packedFileReader
+}
+
+func (w packedFeedWriter) Write(p []byte) (int, error) {
+	w.f.feedPackedChecks(p)
+	return len(p), nil
 }
 
 func (f *packedFileReader) Stat() (fs.FileInfo, error) {
@@ -267,6 +365,7 @@ func (f *packedFileReader) nextBlock() error {
 	f.h = h
 	f.offset = h.dataOff
 	f.blocks.addBlock(h)
+	f.resetPackedChecks()
 	return nil
 }
 
@@ -304,11 +403,17 @@ func (f *packedFileReader) currFile() *fileBlockHeader { return f.h }
 func (f *packedFileReader) Read(p []byte) (int, error) {
 	for {
 		n, err := f.v.Read(p)
+		if n > 0 {
+			f.offset += int64(n)
+			f.feedPackedChecks(p[:n])
+		}
 		if err == io.EOF {
+			if cerr := f.finishPackedBlock(); cerr != nil {
+				return n, cerr
+			}
 			err = f.nextBlock()
 		}
 		if n > 0 || err != nil {
-			f.offset += int64(n)
 			return n, err
 		}
 	}
@@ -319,9 +424,13 @@ func (f *packedFileReader) ReadByte() (byte, error) {
 		b, err := f.v.ReadByte()
 		if err == nil {
 			f.offset++
+			f.feedPackedChecks([]byte{b})
 			return b, nil
 		}
 		if err == io.EOF {
+			if cerr := f.finishPackedBlock(); cerr != nil {
+				return 0, cerr
+			}
 			err = f.nextBlock()
 			if err == nil {
 				continue
@@ -340,17 +449,25 @@ func (f *packedFileReader) writeToN(w io.Writer, n int64) (int64, error) {
 	todo := n
 	for todo != 0 && err == nil {
 		var l int64
-		l, err = f.v.writeToAtMost(w, todo)
+		l, err = f.v.writeToAtMost(f.packedTapWriter(w), todo)
 		if todo > 0 {
 			todo -= l
 		}
 		tot += int64(l)
 		if err == nil && todo != 0 {
+			if cerr := f.finishPackedBlock(); cerr != nil {
+				return tot, cerr
+			}
 			err = f.nextBlock()
 		}
 	}
-	if todo <= 0 && err == io.EOF {
-		err = nil
+	if err == io.EOF {
+		if cerr := f.finishPackedBlock(); cerr != nil {
+			return tot, cerr
+		}
+		if todo <= 0 {
+			err = nil
+		}
 	}
 	return tot, err
 }
@@ -407,8 +524,17 @@ func (pr *packedFileReader) newArchiveFileFrom(r archiveFile, blocks *fileBlockL
 		// Limit reading to UnPackedSize as there may be padding
 		r = newLimitedReader(r, h.UnPackedSize)
 	}
-	if h.hash != nil && !pr.opt.skipCheck {
-		r = newChecksumReader(r, h.hash(), blocks.removeFileHash)
+	if !pr.opt.skipCheck {
+		var checks []fileChecksum
+		if h.hash != nil {
+			checks = append(checks, fileChecksum{kind: checksumCRC32, hash: h.hash()})
+		}
+		if h.blake2 != nil {
+			checks = append(checks, fileChecksum{kind: checksumBLAKE2, hash: h.blake2()})
+		}
+		if len(checks) > 0 {
+			r = newChecksumReader(r, checks, blocks.removeFileHash)
+		}
 	}
 	return r, nil
 }
@@ -428,6 +554,12 @@ func (f *packedFileReadSeeker) openBlock(h *fileBlockHeader, offset int64) (int6
 	}
 	f.h = h
 	f.offset = h.packedOff + offset
+	f.resetPackedChecks()
+	// packed bytes before the seek offset are not hashed again
+	f.pcRead = offset
+	if offset != 0 {
+		f.pcOn = false
+	}
 	return f.offset, nil
 }
 
@@ -600,33 +732,71 @@ func newLimitedReader(f archiveFile, size int64) archiveFile {
 	return &lr
 }
 
+type checksumKind int
+
+const (
+	checksumCRC32 checksumKind = iota
+	checksumBLAKE2
+)
+
+// fileChecksum is a single declared unpacked file checksum.
+type fileChecksum struct {
+	kind checksumKind
+	hash hash.Hash
+}
+
+// expected returns the digest declared for the checksum by the last file
+// block header.
+func (c fileChecksum) expected(h *fileBlockHeader) []byte {
+	if c.kind == checksumCRC32 {
+		return h.sum
+	}
+	return h.blake2sum
+}
+
 type checksumReader struct {
 	archiveFile
-	hash    hash.Hash
+	checks  []fileChecksum
 	success func()
 	eofErr  error
+}
+
+// convertHashToMAC transforms a calculated file checksum with the optional
+// encryption hash key, as required by the RAR 5.0 file encryption record.
+// CRC32 checksums use the XOR folded 32 bit HMAC-SHA256, BLAKE2sp checksums
+// use the full 32 byte HMAC-SHA256.
+func convertHashToMAC(sum, key []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(sum) // ignore error, should always succeed
+	digest := mac.Sum(nil)
+	if len(sum) == 4 {
+		// CRC32: fold the 32 byte HMAC into 4 bytes with XOR
+		folded := make([]byte, 4)
+		for i, v := range digest {
+			folded[i&3] ^= v
+		}
+		return folded
+	}
+	return digest[:len(sum)]
 }
 
 func (cr *checksumReader) eofError() error {
 	if cr.eofErr != nil {
 		return cr.eofErr
 	}
-	// calculate file checksum
+	// calculate file checksums
 	h := cr.currFile()
-	sum := cr.hash.Sum(nil)
-	if len(h.hashKey) > 0 {
-		mac := hmac.New(sha256.New, h.hashKey)
-		_, _ = mac.Write(sum) // ignore error, should always succeed
-		sum = mac.Sum(sum[:0])
-		if len(h.sum) == 4 {
-			// CRC32
-			for i, v := range sum[4:] {
-				sum[i&3] ^= v
-			}
-			sum = sum[:4]
+	ok := true
+	for _, c := range cr.checks {
+		sum := c.hash.Sum(nil)
+		if len(h.hashKey) > 0 {
+			sum = convertHashToMAC(sum, h.hashKey)
+		}
+		if !bytes.Equal(sum, c.expected(h)) {
+			ok = false
 		}
 	}
-	if !bytes.Equal(sum, h.sum) {
+	if !ok {
 		cr.eofErr = ErrBadFileChecksum
 	} else {
 		cr.eofErr = io.EOF
@@ -637,11 +807,20 @@ func (cr *checksumReader) eofError() error {
 	return cr.eofErr
 }
 
+func (cr *checksumReader) writeChecksums(p []byte) error {
+	for _, c := range cr.checks {
+		if _, err := c.hash.Write(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (cr *checksumReader) Read(p []byte) (int, error) {
 	n, err := cr.archiveFile.Read(p)
 	if n > 0 {
-		if n, err = cr.hash.Write(p[:n]); err != nil {
-			return n, err
+		if werr := cr.writeChecksums(p[:n]); werr != nil {
+			return n, werr
 		}
 	}
 	if err != io.EOF {
@@ -658,9 +837,8 @@ func (cr *checksumReader) ReadByte() (byte, error) {
 		}
 		return 0, cr.eofError()
 	}
-	_, err = cr.hash.Write([]byte{b})
-	if err != nil {
-		return 0, err
+	if werr := cr.writeChecksums([]byte{b}); werr != nil {
+		return 0, werr
 	}
 	return b, err
 }
@@ -670,7 +848,12 @@ func (cr *checksumReader) writeToN(w io.Writer, n int64) (int64, error) {
 }
 
 func (cr *checksumReader) WriteTo(w io.Writer) (int64, error) {
-	mw := io.MultiWriter(w, cr.hash)
+	writers := make([]io.Writer, 0, len(cr.checks)+1)
+	writers = append(writers, w)
+	for _, c := range cr.checks {
+		writers = append(writers, c.hash)
+	}
+	mw := io.MultiWriter(writers...)
 	n, err := cr.archiveFile.WriteTo(mw)
 	if err == nil || err == io.EOF {
 		err = cr.eofError()
@@ -681,8 +864,8 @@ func (cr *checksumReader) WriteTo(w io.Writer) (int64, error) {
 	return n, nil
 }
 
-func newChecksumReader(f archiveFile, h hash.Hash, success func()) *checksumReader {
-	return &checksumReader{archiveFile: f, hash: h, success: success}
+func newChecksumReader(f archiveFile, checks []fileChecksum, success func()) *checksumReader {
+	return &checksumReader{archiveFile: f, checks: checks, success: success}
 }
 
 // Reader provides sequential access to files in a RAR archive.

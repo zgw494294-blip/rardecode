@@ -239,8 +239,15 @@ func (rfs *RarFS) ReadFile(name string) ([]byte, error) {
 		return nil, ErrFileTooLargeForReadFile
 	}
 	buf := make([]byte, h.UnPackedSize)
-	_, err = io.ReadFull(f, buf)
-	return buf, err
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return nil, err
+	}
+	// Drain to the end of file so checksums are finalized even when the
+	// last Read filled the whole buffer.
+	if _, err := io.Copy(io.Discard, f); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func (rfs *RarFS) ReadLink(name string) (string, error) {

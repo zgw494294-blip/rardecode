@@ -95,9 +95,12 @@ type fileBlockHeader struct {
 	blocknum  int              // number for current block in file
 	volnum    int              // archive volume number
 	winSize   int64            // decode window size
-	hash      func() hash.Hash // hash used for file checksum
+	hash      func() hash.Hash // hash used for unpacked file checksum (first block only)
+	blake2    func() hash.Hash // BLAKE2sp used for unpacked file checksum (first block only)
 	hashKey   []byte           // optional hmac key to be used calculate file checksum
-	sum       []byte           // expected checksum for file contents
+	sum       []byte           // expected CRC32 checksum declared by this block
+	blake2sum []byte           // expected BLAKE2sp checksum declared by this block
+	is50      bool             // block uses RAR 5.0 per-volume packed data checksums
 	decVer    int              // decoder to use for file
 	key       []byte           // key for AES, non-empty if file encrypted
 	iv        []byte           // iv for AES, non-empty if file encrypted
